@@ -1,5 +1,7 @@
 # DSH 插件自动更新
 
+> Check and update DeepSeek Harness plugins from npm — one small, dependency-free Windows GUI.
+
 一个 300 多行、零依赖的 Windows 小工具：列出 DeepSeek Harness 桌面 profile 里装的所有插件，对比 npm 上的最新版本，点一下「一键更新」就按官方方式装好。
 
 ![截图](screenshot.png)
@@ -48,6 +50,7 @@ python  dsh-plugin-updater.pyw --update  :: 直接更新所有可更新项
 - 只更新来自 npm 的插件。写成 `github:` / `file:` / `link:` 的依赖会显示「跳过」，因为查 registry 的 latest 对它们没意义。
 - 本地版本高于 registry 时显示「本地更新（预览版）」，不会被降级。
 - 更新的是 **latest 正式版**，不跟进预发布通道。
+- `@deepseek-ai/*` 宿主包直接跳过——它们随 DSH 本体升级，不在 npm 主线跟随。
 - 界面只有中文。
 
 ## 测试
