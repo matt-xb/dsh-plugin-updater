@@ -1,16 +1,18 @@
 # DSH 插件自动更新
 
-> Check and update DeepSeek Harness plugins from npm — one small, dependency-free Windows GUI.
+> Check, update and uninstall DeepSeek Harness plugins — one small, dependency-free Windows GUI.
 
-一个 300 多行、零依赖的 Windows 小工具：列出 DeepSeek Harness 桌面 profile 里装的所有插件，对比 npm 上的最新版本，点一下「一键更新」就按官方方式装好。
+一个零依赖的 Windows 小工具：列出 DeepSeek Harness 桌面 profile 里装的所有第三方插件，对比 npm 上的最新版本，一键更新，或选中单个插件后确认卸载。
 
 ![截图](screenshot.png)
+
+*早期界面截图；当前版本另有「卸载选中插件」按钮。*
 
 > 非官方工具，与 DeepSeek 官方无关。
 
 ## 为什么用它
 
-`dsh plugin` 只负责装，不负责查。插件多了以后想知道哪个该升级，就得逐个 `npm view`。这个工具把「查」和「升」放一个窗口里，并且**和 dshmarket 商店走同一条安装链路**（`dsh plugin --profile <profile> add`），不会把 profile 弄脏。
+插件多了以后想知道哪个该升级，就得逐个 `npm view`。这个工具把检查、更新和卸载放在一个窗口里，更新仍走 **DSH 官方安装链路**（`dsh plugin --profile <profile> add`），卸载调用官方 `remove`，不自己删包或改写 bundles。
 
 ## 系统要求
 
@@ -28,7 +30,19 @@ python  dsh-plugin-updater.pyw --check   :: 只检查并打印，适合计划任
 python  dsh-plugin-updater.pyw --update  :: 直接更新所有可更新项
 ```
 
-装完需要重启 DeepSeek Harness 才生效。
+更新后需要重启 DeepSeek Harness 才生效。
+
+### 卸载插件
+
+1. 保存任务并完全退出 DSH，再单独打开本工具；不要同时运行其他插件管理器。
+2. 选中插件，点「卸载选中插件」，核对包名、版本和来源，确认后才执行。默认选择取消。
+3. 完成后列表自动刷新，再启动 DSH。检查、更新或卸载进行中不能重复操作或关闭本工具。
+
+- `@deepseek-ai/*` 官方宿主包不会列出，也不能卸载。
+- 来自 `github:` / `file:` / `link:` 的第三方依赖虽然跳过更新检查，仍可卸载。
+- 卸载前将现有的 `package.json`、锁文件、workspace 和 profile patch 备份到 `<DSH_HOME>/backups/plugin-updater/uninstall-*`，路径会写入窗口日志。**这不是完整回滚备份**：不含插件代码和数据，不能只复制清单就当作恢复；重新安装仍需原来源可用。
+- 不主动清理账号、聊天或插件数据，不自动修复自定义配置引用。其他插件若依赖被卸载的包，可能无法启动，确认前请自行核对。
+- 官方命令失败也可能已部分修改 profile；请查看错误和备份，不要盲目反复重试。
 
 ## 配置
 
@@ -36,13 +50,15 @@ python  dsh-plugin-updater.pyw --update  :: 直接更新所有可更新项
 | --- | --- | --- |
 | `DSH_UPDATER_PROFILE` | `desktop` | 要检查的 profile 名 |
 | `DSH_UPDATER_REGISTRY` | `https://registry.npmjs.org` | npm registry，换镜像时用 |
-| `DSH_HOME` | 自动探测 | DSH 数据目录；探测顺序见 `dsh_home()` |
+| `DSH_HOME` | 自动探测 | DSH 数据目录；探测顺序见 `dsh_home()`，会显式传给官方命令，保证操作与列表指向相同目录 |
+| `DSH_UPDATER_DSH` | 自动探测 | `dsh.cmd` 完整路径；默认查 PATH、标准安装位置与 Windows 安装登记。填错会报错，不静默换用其他 CLI |
 
 ## 工作原理
 
 1. 读 `<DSH_HOME>/profiles/<profile>/package.json` 的 `dependencies`。
 2. 并发查 `registry/<pkg>/latest`，按 semver 比较（含预发布版）。
 3. 更新时串行执行 `dsh plugin --profile <profile> add [-w] <pkg>@<ver>`；profile 里有 `pnpm-workspace.yaml` 时才加 `-w`。
+4. 卸载前校验包名、profile 名和当前直接依赖来源，再备份配置；执行 `dsh plugin --profile <profile> remove [-w] <pkg>`，成功后复查依赖已移除。官方 CLI 负责同步 bundles；工具不处理运行中的插件，因此卸载前必须退出 DSH。
 
 ## 已知限制
 

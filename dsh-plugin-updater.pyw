@@ -2,7 +2,7 @@
 """DSH 插件自动更新
 
 双击运行：检查 DeepSeek Harness 桌面 profile 里装的所有插件有没有新版本，
-在列表里点「一键更新」就按官方方式装好（走 dsh plugin add，和 dshmarket 商店同一个流程）。
+点「一键更新」走官方 dsh plugin add；选中插件可确认卸载（官方 remove）。
 
 装完需要重启 DeepSeek Harness 才生效。@deepseek-ai/ 开头的宿主包自动跳过。
 命令行：--check 只检查并打印，--update 直接更新所有可更新项（给自测/计划任务用）。
@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -49,13 +50,30 @@ def profile_dir():
 
 
 def find_dsh():
+    override = os.environ.get("DSH_UPDATER_DSH")
+    if override:
+        return override if os.path.isfile(override) else None
     cand = [shutil.which("dsh"),
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "DeepSeek Harness",
                          "resources", "runtime", "cli", "bin", "dsh.cmd")]
-    for p in cand:
-        if p and os.path.isfile(p):
-            return p
-    return None
+    if os.name == "nt":
+        import winreg
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, r"Software\Microsoft\Windows\CurrentVersion\Uninstall") as key:
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            with winreg.OpenKey(key, winreg.EnumKey(key, i)) as app:
+                                name = winreg.QueryValueEx(app, "DisplayName")[0]
+                                if name.startswith("DeepSeek Harness"):
+                                    location = winreg.QueryValueEx(app, "InstallLocation")[0]
+                                    cand.append(os.path.join(location, "resources", "runtime",
+                                                             "cli", "bin", "dsh.cmd"))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return next((p for p in cand if p and os.path.isfile(p)), None)
 
 
 def installed_plugins():
@@ -149,6 +167,7 @@ def run_update(todo, log, on_progress=None):
             cmd.append("-w")
         cmd.append("%s@%s" % (name, ver))
         p = subprocess.run(cmd, cwd=profile_dir(), capture_output=True, text=True,
+                           env={**os.environ, "DSH_HOME": os.path.abspath(dsh_home())},
                            encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = ((p.stdout or "") + (p.stderr or "")).strip()
@@ -161,6 +180,63 @@ def run_update(todo, log, on_progress=None):
         if on_progress:
             on_progress(i)
     return ok, failed
+
+
+def validate_uninstall(name, declared):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", PROFILE):
+        raise ValueError("无效的 profile 名称，只支持字母、数字、点、下划线和连字符")
+    if (not isinstance(name, str) or len(name) > 214 or
+            not re.fullmatch(r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*", name)):
+        raise ValueError("无效的插件包名")
+    if name.startswith(SKIP):
+        raise ValueError("不能卸载 DSH 官方宿主包")
+    current = {n: d for n, d, _ in installed_plugins()}
+    if name not in current:
+        raise ValueError("插件已不在当前 profile，请重新检查")
+    if current[name] != declared:
+        raise ValueError("插件来源已变化，请重新检查后再卸载")
+
+
+def run_uninstall(name, declared, log):
+    """只移除已安装的第三方 direct dependency；不清理插件配置或数据。"""
+    validate_uninstall(name, declared)
+    dsh = find_dsh()
+    if not dsh:
+        raise RuntimeError("找不到 dsh 命令，请配置 DSH_UPDATER_DSH 为 dsh.cmd 的完整路径")
+    backup_root = os.path.join(dsh_home(), "backups", "plugin-updater")
+    os.makedirs(backup_root, exist_ok=True)
+    backup = tempfile.mkdtemp(prefix="uninstall-", dir=backup_root)
+    for filename in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "cordis.patch.yml"):
+        source = os.path.join(profile_dir(), filename)
+        if os.path.isfile(source):
+            shutil.copy2(source, os.path.join(backup, filename))
+    log("卸载前配置备份：%s（不含插件代码，不可仅复制清单还原）" % backup)
+    validate_uninstall(name, declared)
+    cmd = (["cmd", "/c", dsh] if os.name == "nt" else [dsh]) + \
+          ["plugin", "--profile", PROFILE, "remove"]
+    if os.path.exists(os.path.join(profile_dir(), "pnpm-workspace.yaml")):
+        cmd.append("-w")
+    cmd.append(name)
+    log("卸载 %s …" % name)
+    p = subprocess.run(cmd, cwd=profile_dir(), capture_output=True, text=True,
+                       env={**os.environ, "DSH_HOME": os.path.abspath(dsh_home())},
+                       encoding="utf-8", errors="replace",
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    if p.returncode or any(n == name for n, _, _ in installed_plugins()):
+        raise RuntimeError("卸载未完成，profile 可能已部分改变，请检查后再重试。配置备份：%s\n%s" %
+                           (backup, out[-2000:] or "命令未移除该依赖"))
+    log("✓ 已卸载 %s；重启 DSH 后生效。配置备份：%s" % (name, backup))
+    return backup
+
+
+def uninstall_confirm_text(row):
+    return ("将从当前 profile 卸载：\n\n%s  %s\n来源：%s\n\n"
+            "请先保存任务并退出 DSH，且不要同时运行其他插件管理器。\n"
+            "这不是停用：其他依赖它的插件可能失效。\n"
+            "仅调用官方 remove，不主动清理账号、聊天或插件数据；自定义配置引用不会自动修复。\n"
+            "卸载前保存配置备份（不是完整回滚）；重新安装仍需原来源可用。\n\n确认卸载？" %
+            (row["name"], row["installed"], row["declared"]))
 
 
 STATE_TEXT = {"newer": "有更新", "same": "已是最新", "preview": "本地更新（预览版）",
@@ -216,13 +292,15 @@ def build_ui():
     btn_all = ttk.Button(bar, text="一键更新")
     btn_all.pack(side="left", padx=(8, 0))
     btn_all.state(["disabled"])
+    btn_remove = ttk.Button(bar, text="卸载选中插件", state="disabled")
+    btn_remove.pack(side="left", padx=(8, 0))
     progress = ttk.Progressbar(bar, mode="indeterminate", length=180)
     progress.pack(side="right")
 
     wrap = ttk.Frame(root, padding=(14, 0, 14, 8))
     wrap.pack(fill="both", expand=True)
     tree = ttk.Treeview(wrap, columns=("name", "installed", "latest", "state"),
-                        show="headings", height=10)
+                        show="headings", height=10, selectmode="browse")
     for c, t, w, a in (("name", "插件", 380, "w"), ("installed", "当前版本", 120, "center"),
                        ("latest", "最新版本", 120, "center"), ("state", "状态", 160, "w")):
         tree.heading(c, text=t)
@@ -240,6 +318,27 @@ def build_ui():
     logbox.pack(fill="x", padx=14, pady=(0, 12))
 
     state = {"rows": [], "busy": False}
+
+    def selected_row():
+        selected = tree.selection()
+        if not selected:
+            return None
+        name = tree.item(selected[0], "values")[0]
+        return next((r for r in state["rows"] if r["name"] == name), None)
+
+    def sync_remove(event=None):
+        row = selected_row()
+        allowed = not state["busy"] and row and not row["name"].startswith(SKIP)
+        btn_remove.state(["!disabled"] if allowed else ["disabled"])
+
+    def close():
+        if state["busy"]:
+            messagebox.showinfo("正在处理", "请等待当前操作完成后再关闭窗口。", parent=root)
+        else:
+            root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close)
+    tree.bind("<<TreeviewSelect>>", sync_remove)
 
     def log(msg):
         def _():
@@ -265,28 +364,38 @@ def build_ui():
         state["busy"] = True
         btn_check.state(["disabled"])
         btn_all.state(["disabled"])
+        btn_remove.state(["disabled"])
         progress.start(12)
         set_status("正在检查…")
+        state["rows"] = []
+        paint([])
 
-        def work():
-            try:
-                rows = check_all()
+        def finish(rows, error):
+            state["busy"] = False
+            progress.stop()
+            btn_check.state(["!disabled"])
+            if error:
+                set_status("检查失败")
+                log("检查失败：%s" % error)
+            else:
                 state["rows"] = rows
+                paint(rows)
                 newer = [r for r in rows if r["state"] == "newer"]
-                root.after(0, lambda: paint(rows))
-                root.after(0, lambda: btn_all.state(["!disabled"] if newer else ["disabled"]))
+                btn_all.state(["!disabled"] if newer else ["disabled"])
                 set_status("共 %d 个插件，%d 个可更新 · %s"
                            % (len(rows), len(newer), time.strftime("%H:%M:%S")))
                 log("检查完成：%d 个插件，%d 个可更新" % (len(rows), len(newer)))
+            sync_remove()
+            if after:
+                after()
+
+        def work():
+            rows, error = [], None
+            try:
+                rows = check_all()
             except Exception as e:
-                set_status("检查失败")
-                log("检查失败：%s" % e)
-            finally:
-                state["busy"] = False
-                root.after(0, lambda: btn_check.state(["!disabled"]))
-                root.after(0, progress.stop)
-                if after:
-                    after()
+                error = str(e)
+            root.after(0, lambda: finish(rows, error))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -302,9 +411,23 @@ def build_ui():
         state["busy"] = True
         btn_check.state(["disabled"])
         btn_all.state(["disabled"])
+        btn_remove.state(["disabled"])
         progress.stop()
         progress.configure(mode="determinate", value=0, maximum=len(todo))
         set_status("正在更新…")
+
+        def finish(ok, failed):
+            state["busy"] = False
+            progress.configure(mode="indeterminate", value=0)
+            set_status(("完成 %d 个，失败 %d 个" % (len(ok), len(failed))) if failed
+                       else "更新完成，重启 DeepSeek Harness 后生效")
+            log("—— 成功 %d，失败 %d ——" % (len(ok), len(failed)))
+            btn_check.state(["!disabled"])
+            sync_remove()
+            if after:
+                after()
+            elif not failed:
+                do_check()
 
         def work():
             ok, failed = [], []
@@ -315,20 +438,47 @@ def build_ui():
             except Exception as e:
                 log("更新失败：%s" % e)
                 failed = [n for n, _ in todo]
-            finally:
-                state["busy"] = False
-                root.after(0, lambda: progress.configure(mode="indeterminate", value=0))
-                set_status(("完成 %d 个，失败 %d 个" % (len(ok), len(failed))) if failed
-                           else "更新完成，重启 DeepSeek Harness 后生效")
-                log("—— 成功 %d，失败 %d ——" % (len(ok), len(failed)))
-                root.after(0, lambda: btn_check.state(["!disabled"]))
-                if after:
-                    after()
-                elif not failed:
-                    root.after(200, lambda: do_check())
+            root.after(0, lambda: finish(ok, failed))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def do_remove():
+        row = selected_row()
+        if state["busy"] or not row:
+            return
+        if not messagebox.askyesno("确认卸载", uninstall_confirm_text(row),
+                                   icon="warning", default="no", parent=root):
+            return
+        state["busy"] = True
+        btn_check.state(["disabled"])
+        btn_all.state(["disabled"])
+        btn_remove.state(["disabled"])
+        progress.start(12)
+        set_status("正在卸载 %s…" % row["name"])
+
+        def finish(error):
+            state["busy"] = False
+            progress.stop()
+            btn_check.state(["!disabled"])
+            if error:
+                messagebox.showerror("卸载失败", error, parent=root)
+            else:
+                messagebox.showinfo("卸载完成", "已卸载 %s。\n请重启 DeepSeek Harness 后生效。" %
+                                    row["name"], parent=root)
+            do_check()
+
+        def work():
+            error = None
+            try:
+                run_uninstall(row["name"], row["declared"], log)
+            except Exception as e:
+                error = str(e)
+                log("卸载失败：%s" % error)
+            root.after(0, lambda: finish(error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    btn_remove.configure(command=do_remove)
     btn_check.configure(command=do_check)
     btn_all.configure(command=do_update)
     log("DSH 插件自动更新 · profile %s" % profile_dir())
