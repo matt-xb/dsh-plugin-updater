@@ -168,6 +168,150 @@ class TestUninstall(unittest.TestCase):
                 updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
             run.assert_not_called()
 
+    def write_workspace(self, text):
+        path = os.path.join(self.profile, "pnpm-workspace.yaml")
+        with open(path, "wb") as f:
+            f.write(text.encode("utf-8"))
+        return path
+
+    def unused_patch_error(self, keys="demo-plugin@1.0.0"):
+        return SimpleNamespace(returncode=1, stdout=(
+            "[ERR_PNPM_UNUSED_PATCH] The following patches were not used: " + keys + "\n"), stderr="")
+
+    def test_unused_selected_patch_cleanup_and_one_retry(self):
+        original = "packages:\n  - .\npatchedDependencies:\n  demo-plugin@1.0.0: patches/demo.patch\n"
+        workspace = self.write_workspace(original)
+        patch_file = os.path.join(self.profile, "demo.patch")
+        with open(patch_file, "w") as f:
+            f.write("preserve patch contents")
+        calls = []
+        def remove(cmd, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return self.unused_patch_error()
+            with open(workspace) as f:
+                self.assertEqual(f.read(), "packages:\n  - .\npatchedDependencies: {}\n")
+            return self.fake_remove(cmd, **kwargs)
+        with patch.object(updater.subprocess, "run", side_effect=remove):
+            backup = updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        with open(os.path.join(backup, "pnpm-workspace.yaml")) as f:
+            self.assertEqual(f.read(), original)
+        with open(patch_file) as f:
+            self.assertEqual(f.read(), "preserve patch contents")
+
+    def test_patch_cleanup_preserves_other_versions_policies_and_crlf(self):
+        before = ("\ufeffpackages:\r\n  - .\r\npatchedDependencies: # patches\r\n"
+                  "  'demo-plugin@1.0.0': patches/old.patch\r\n"
+                  "  \"demo-plugin@2.0.0\": patches/used.patch\r\n"
+                  "  demo-plugin-extra@1.0.0: patches/other.patch\r\n"
+                  "allowBuilds:\r\n  sharp@0.32.6: true\r\n")
+        path = self.write_workspace(before)
+        error = self.unused_patch_error("demo-plugin@1.0.0, demo-plugin-extra@1.0.0")
+        self.assertTrue(updater.remove_unused_patch_entries("demo-plugin", error.stdout, self.logs.append))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before.replace("  'demo-plugin@1.0.0': patches/old.patch\r\n", "").encode("utf-8"))
+
+    def test_scoped_patch_and_unversioned_key(self):
+        path = self.write_workspace("patchedDependencies:\n  '@owner/demo': patches/a.patch\n")
+        error = self.unused_patch_error("@owner/demo")
+        self.assertTrue(updater.remove_unused_patch_entries("@owner/demo", error.stdout, self.logs.append))
+        with open(path) as f:
+            self.assertEqual(f.read(), "patchedDependencies: {}\n")
+
+    def test_unsupported_patch_yaml_is_unchanged(self):
+        for original in (
+                'patchedDependencies: {demo-plugin@1.0.0: patches/a.patch}\n',
+                'patchedDependencies:\n  demo-plugin@1.0.0: &shared patches/a.patch\n',
+                'patchedDependencies:\n  demo-plugin@1.0.0: |\n    patches/a.patch\n',
+                'patchedDependencies:\n  <<: *patches\n',
+                'patchedDependencies:\n  demo-plugin@1.0.0: a\n  demo-plugin@1.0.0: b\n'):
+            with self.subTest(original=original):
+                path = self.write_workspace(original)
+                with self.assertRaisesRegex(RuntimeError, "未自动修改"):
+                    updater.remove_unused_patch_entries("demo-plugin", self.unused_patch_error().stdout, self.logs.append)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original.encode("utf-8"))
+
+    def test_unused_unrelated_patch_does_not_modify_or_retry(self):
+        original = "patchedDependencies: {other@1.0.0: patches/other.patch}\n"
+        path = self.write_workspace(original)
+        with patch.object(updater.subprocess, "run", return_value=self.unused_patch_error("other@1.0.0")) as run:
+            with self.assertRaisesRegex(RuntimeError, "UNUSED_PATCH"):
+                updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(run.call_count, 1)
+        with open(path) as f:
+            self.assertEqual(f.read(), original)
+
+    def test_used_transitive_patch_is_never_removed(self):
+        original = "patchedDependencies:\n  demo-plugin@1.0.0: patches/a.patch\n"
+        path = self.write_workspace(original)
+        with patch.object(updater.subprocess, "run", side_effect=self.fake_remove) as run:
+            updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(run.call_count, 1)
+        with open(path) as f:
+            self.assertEqual(f.read(), original)
+
+    def test_patch_retry_failure_stops_after_two_calls(self):
+        self.write_workspace("patchedDependencies:\n  demo-plugin@1.0.0: patches/a.patch\n")
+        with patch.object(updater.subprocess, "run", side_effect=[self.unused_patch_error(),
+                SimpleNamespace(returncode=1, stdout="second failure", stderr="")]) as run:
+            with self.assertRaisesRegex(RuntimeError, "second failure"):
+                updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(run.call_count, 2)
+
+    def test_partial_manifest_change_stops_before_patch_cleanup(self):
+        original = "patchedDependencies:\n  demo-plugin@1.0.0: patches/a.patch\n"
+        path = self.write_workspace(original)
+        def partial_remove(*args, **kwargs):
+            self.write_manifest({})
+            return self.unused_patch_error()
+        with patch.object(updater.subprocess, "run", side_effect=partial_remove) as run:
+            with self.assertRaisesRegex(RuntimeError, "已不在当前 profile"):
+                updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(run.call_count, 1)
+        with open(path) as f:
+            self.assertEqual(f.read(), original)
+
+    def test_source_change_after_first_error_stops_without_patch_edits(self):
+        original = "patchedDependencies:\n  demo-plugin@1.0.0: patches/a.patch\n"
+        path = self.write_workspace(original)
+        def change_source(*args, **kwargs):
+            self.write_manifest({"demo-plugin": "2.0.0"})
+            return self.unused_patch_error()
+        with patch.object(updater.subprocess, "run", side_effect=change_source) as run:
+            with self.assertRaisesRegex(RuntimeError, "来源已变化"):
+                updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(run.call_count, 1)
+        with open(path) as f:
+            self.assertEqual(f.read(), original)
+
+    def test_atomic_replace_failure_preserves_config_and_cleans_temp(self):
+        original = "patchedDependencies:\n  demo-plugin@1.0.0: patches/a.patch\n"
+        path = self.write_workspace(original)
+        with patch.object(updater.os, "replace", side_effect=PermissionError("replace denied")):
+            with self.assertRaisesRegex(PermissionError, "replace denied"):
+                updater.remove_unused_patch_entries("demo-plugin", self.unused_patch_error().stdout, self.logs.append)
+        with open(path) as f:
+            self.assertEqual(f.read(), original)
+        self.assertFalse(any(name.startswith(".updater-patch-") for name in os.listdir(self.profile)))
+
+    def test_snapshot_change_preserved_and_not_retried(self):
+        path = self.write_workspace("patchedDependencies:\n  demo-plugin@1.0.0: patches/a.patch\n")
+        original_temp = updater.tempfile.NamedTemporaryFile
+        def change_workspace(**kwargs):
+            self.write_workspace("concurrent: changed\n")
+            return original_temp(**kwargs)
+        with patch.object(updater.tempfile, "NamedTemporaryFile", side_effect=change_workspace), \
+                patch.object(updater.subprocess, "run", return_value=self.unused_patch_error()) as run:
+            with self.assertRaisesRegex(RuntimeError, "其他程序修改"):
+                updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
+        self.assertEqual(run.call_count, 1)
+        with open(path) as f:
+            self.assertEqual(f.read(), "concurrent: changed\n")
+        self.assertFalse(any(name.startswith(".updater-patch-") for name in os.listdir(self.profile)))
+
     def write_installed_version(self, version):
         folder = os.path.join(self.profile, "node_modules", "demo-plugin")
         os.makedirs(folder, exist_ok=True)

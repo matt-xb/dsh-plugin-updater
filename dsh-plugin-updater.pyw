@@ -208,8 +208,77 @@ def validate_uninstall(name, declared):
         raise ValueError("插件来源已变化，请重新检查后再卸载")
 
 
+def remove_unused_patch_entries(name, output, log):
+    """只移除 pnpm 已确认闲置、且属于所选插件的补丁登记；不删除补丁文件。"""
+    if "ERR_PNPM_UNUSED_PATCH" not in output:
+        return False
+    message = re.search(r"The following patches were not used: ([^\r\n]+)", output)
+    if not message:
+        return False
+    keys = {key.strip() for key in message[1].split(",")
+            if key.strip() == name or key.strip().startswith(name + "@")}
+    if not keys:
+        return False
+    path = os.path.join(profile_dir(), "pnpm-workspace.yaml")
+    if not os.path.isfile(path):
+        return False
+    with open(path, "rb") as f:
+        original = f.read()
+    lines = original.decode("utf-8-sig").splitlines(keepends=True)
+    headers = [i for i, line in enumerate(lines)
+               if re.match(r"^(?:patchedDependencies|'patchedDependencies'|\"patchedDependencies\"):", line)]
+    if not headers:
+        return False
+    unsupported = "补丁配置不是简单块映射，未自动修改；请核对补丁登记后再卸载"
+    if len(headers) != 1:
+        raise RuntimeError(unsupported)
+    start = headers[0]
+    if not re.fullmatch(r"[^:]+:\s*(?:#[^\r\n]*)?\r?\n?", lines[start]):
+        raise RuntimeError(unsupported)
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].startswith((" ", "\t", "#"))):
+        end += 1
+    entries, indent = {}, None
+    for i in range(start + 1, end):
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        entry = re.fullmatch(r"( +)(?:\"([^\"]+)\"|'([^']+)'|([^\s:'\"]+)):[ \t]+([^\r\n]+)\r?\n?", line)
+        if not entry or any(c in entry[5] for c in "&*{}[]|>"):
+            raise RuntimeError(unsupported)
+        key = entry[2] or entry[3] or entry[4]
+        if indent is None:
+            indent = entry[1]
+        if indent != entry[1] or key in entries or key == "<<":
+            raise RuntimeError(unsupported)
+        entries[key] = i
+    selected = keys.intersection(entries)
+    if not selected:
+        return False
+    removed = {entries[key] for key in selected}
+    if len(removed) == len(entries):
+        lines[start] = lines[start].replace(":", ": {}", 1)
+    updated = "".join(line for i, line in enumerate(lines) if i not in removed).encode("utf-8")
+    if original.startswith(b"\xef\xbb\xbf"):
+        updated = b"\xef\xbb\xbf" + updated
+    # shortcut: 仅支持普通块映射；出现复杂 YAML 时需使用正式 YAML 编辑器处理。
+    with tempfile.NamedTemporaryFile(dir=profile_dir(), prefix=".updater-patch-", delete=False) as f:
+        f.write(updated)
+        temporary = f.name
+    try:
+        with open(path, "rb") as f:
+            if f.read() != original:
+                raise RuntimeError("补丁配置已被其他程序修改，停止卸载重试（未替换配置）")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    log("已移除所选插件的闲置补丁登记（保留补丁文件）：%s" % ", ".join(sorted(selected)))
+    return True
+
+
 def run_uninstall(name, declared, log):
-    """只移除已安装的第三方 direct dependency；不清理插件配置或数据。"""
+    """只移除已安装的第三方 direct dependency；保留账号、聊天和插件数据。"""
     validate_uninstall(name, declared)
     dsh = find_dsh()
     if not dsh:
@@ -234,6 +303,19 @@ def run_uninstall(name, declared, log):
                        encoding="utf-8", errors="replace",
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     out = ((p.stdout or "") + (p.stderr or "")).strip()
+    if p.returncode and "ERR_PNPM_UNUSED_PATCH" in out:
+        try:
+            validate_uninstall(name, declared)
+            if remove_unused_patch_entries(name, out, log):
+                validate_uninstall(name, declared)
+                log("闲置补丁登记已清理，重试官方卸载（仅一次）…")
+                p = subprocess.run(cmd, cwd=profile_dir(), capture_output=True, text=True,
+                                   env={**os.environ, "DSH_HOME": os.path.abspath(dsh_home())},
+                                   encoding="utf-8", errors="replace",
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                out = ((p.stdout or "") + (p.stderr or "")).strip()
+        except Exception as e:
+            raise RuntimeError("卸载未完成；配置备份：%s\n%s" % (backup, e)) from e
     if p.returncode or any(n == name for n, _, _ in installed_plugins()):
         raise RuntimeError("卸载未完成，profile 可能已部分改变，请检查后再重试。配置备份：%s\n%s" %
                            (backup, out[-2000:] or "命令未移除该依赖"))
@@ -245,7 +327,8 @@ def uninstall_confirm_text(row):
     return ("将从当前 profile 卸载：\n\n%s  %s\n来源：%s\n\n"
             "请先保存任务并退出 DSH，且不要同时运行其他插件管理器。\n"
             "这不是停用：其他依赖它的插件可能失效。\n"
-            "仅调用官方 remove，不主动清理账号、聊天或插件数据；自定义配置引用不会自动修复。\n"
+            "通过官方 remove 卸载；仅清理它确认闲置的本插件补丁登记，保留补丁文件。\n"
+            "不主动清理账号、聊天或插件数据；自定义配置引用不会自动修复。\n"
             "卸载前保存配置备份（不是完整回滚）；重新安装仍需原来源可用。\n\n确认卸载？" %
             (row["name"], row["installed"], row["declared"]))
 
