@@ -168,12 +168,19 @@ class TestUninstall(unittest.TestCase):
                 updater.run_uninstall("demo-plugin", "^1.0.0", self.logs.append)
             run.assert_not_called()
 
+    def write_installed_version(self, version):
+        folder = os.path.join(self.profile, "node_modules", "demo-plugin")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "package.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": version}, f)
+
     def test_update_uses_same_home_and_reports_progress(self):
+        self.write_installed_version("1.1.0")
         progress = []
         with patch.object(updater.subprocess, "run", return_value=SimpleNamespace(
                 returncode=0, stdout="", stderr="")) as run:
             result = updater.run_update([("demo-plugin", "1.1.0")], self.logs.append, progress.append)
-        self.assertEqual(result, (["demo-plugin"], []))
+        self.assertEqual(result, (["demo-plugin"], [], []))
         self.assertEqual(progress, [1])
         self.assertEqual(run.call_args.kwargs["env"]["DSH_HOME"], os.path.abspath(self.home))
         self.assertEqual(run.call_args.args[0][-5:],
@@ -183,8 +190,41 @@ class TestUninstall(unittest.TestCase):
         with patch.object(updater.subprocess, "run", return_value=SimpleNamespace(
                 returncode=1, stdout="", stderr="fixture update failure")):
             result = updater.run_update([("demo-plugin", "1.1.0")], self.logs.append)
-        self.assertEqual(result, ([], ["demo-plugin"]))
+        self.assertEqual(result, ([], [], ["demo-plugin"]))
         self.assertTrue(any("fixture update failure" in line for line in self.logs))
+
+    def test_updated_files_with_blocked_builds_are_incomplete(self):
+        self.write_installed_version("1.1.0")
+        with patch.object(updater.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="ERR_PNPM_IGNORED_BUILDS", stderr="")):
+            result = updater.run_update([("demo-plugin", "1.1.0")], self.logs.append)
+        self.assertEqual(result, ([], ["demo-plugin"], []))
+        self.assertTrue(any("版本已更新，但安装未完成" in line for line in self.logs))
+        self.assertTrue(any("不要关闭整体安全检查" in line for line in self.logs))
+
+    def test_other_error_with_updated_files_remains_incomplete(self):
+        self.write_installed_version("1.1.0")
+        with patch.object(updater.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="other error")):
+            result = updater.run_update([("demo-plugin", "1.1.0")], self.logs.append)
+        self.assertEqual(result, ([], ["demo-plugin"], []))
+
+    def test_success_exit_without_target_files_is_failure(self):
+        for version in (None, "1.0.0"):
+            if version:
+                self.write_installed_version(version)
+            with self.subTest(version=version), patch.object(updater.subprocess, "run",
+                    return_value=SimpleNamespace(returncode=0, stdout="", stderr="")):
+                result = updater.run_update([("demo-plugin", "1.1.0")], self.logs.append)
+            self.assertEqual(result, ([], [], ["demo-plugin"]))
+
+    def test_cli_incomplete_update_has_nonzero_exit(self):
+        rows = [{"name": "demo-plugin", "latest": "1.1.0", "state": "newer"}]
+        with patch.object(updater.sys, "argv", ["updater", "--update"]), \
+                patch.object(updater, "check_all", return_value=rows), \
+                patch.object(updater, "run_update", return_value=([], ["demo-plugin"], [])), \
+                patch("builtins.print"):
+            self.assertEqual(updater.main(), 1)
 
     def test_confirmation_names_target_and_limits(self):
         text = updater.uninstall_confirm_text({"name": "demo-plugin", "installed": "1.0.0",

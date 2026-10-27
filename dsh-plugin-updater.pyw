@@ -153,11 +153,11 @@ def check_all():
 
 
 def run_update(todo, log, on_progress=None):
-    """todo: [(包名, 版本)]，串行安装（并发动同一个 node_modules 会打架）。返回 (成功, 失败)。"""
+    """todo: [(包名, 版本)]，串行安装（并发动同一个 node_modules 会打架）。返回 (成功, 未完成, 失败)；非零退出但版本已落盘不等于安装成功。"""
     dsh = find_dsh()
     if not dsh:
         raise RuntimeError("找不到 dsh 命令：DeepSeek Harness 装到别的路径了？")
-    ok, failed = [], []
+    ok, incomplete, failed = [], [], []
     for i, (name, ver) in enumerate(todo, 1):
         log("(%d/%d) 安装 %s@%s …" % (i, len(todo), name, ver))
         cmd = (["cmd", "/c", dsh] if os.name == "nt" else [dsh]) + \
@@ -171,15 +171,26 @@ def run_update(todo, log, on_progress=None):
                            encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = ((p.stdout or "") + (p.stderr or "")).strip()
-        if p.returncode == 0:
+        try:
+            with open(os.path.join(profile_dir(), "node_modules", name, "package.json"),
+                      encoding="utf-8") as f:
+                installed = json.load(f)["version"]
+        except (OSError, ValueError, KeyError):
+            installed = None
+        if p.returncode == 0 and installed == ver:
             ok.append(name)
             log("    ✓ %s 完成" % name)
+        elif installed == ver:
+            incomplete.append(name)
+            log("    ⚠ %s 版本已更新，但安装未完成：%s" % (name, out[-600:] or "(无输出)"))
         else:
             failed.append(name)
-            log("    ✗ %s 失败：%s" % (name, out[-600:] or "(无输出)"))
+            log("    ✗ %s 失败（未确认目标版本）：%s" % (name, out[-600:] or "(无输出)"))
+        if "ERR_PNPM_IGNORED_BUILDS" in out:
+            log("    依赖安装脚本被拦截；请核对后仅批准必要版本，不要关闭整体安全检查。")
         if on_progress:
             on_progress(i)
-    return ok, failed
+    return ok, incomplete, failed
 
 
 def validate_uninstall(name, declared):
@@ -240,7 +251,8 @@ def uninstall_confirm_text(row):
 
 
 STATE_TEXT = {"newer": "有更新", "same": "已是最新", "preview": "本地更新（预览版）",
-              "error": "查询失败", "skip": "跳过（非 npm）"}
+              "error": "查询失败", "skip": "跳过（非 npm）",
+              "incomplete": "版本已更新，安装未完成", "failed": "更新失败"}
 
 
 def confirm_text(rows, todo):
@@ -306,7 +318,7 @@ def build_ui():
         tree.heading(c, text=t)
         tree.column(c, width=w, anchor=a, stretch=(c == "name"))
     for tag, color in (("newer", "#0a7d32"), ("error", "#b3261e"), ("preview", "#8a6d00"),
-                       ("skip", "#777777")):
+                       ("skip", "#777777"), ("incomplete", "#8a6d00"), ("failed", "#b3261e")):
         tree.tag_configure(tag, foreground=color)
     ys = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=ys.set)
@@ -416,29 +428,43 @@ def build_ui():
         progress.configure(mode="determinate", value=0, maximum=len(todo))
         set_status("正在更新…")
 
-        def finish(ok, failed):
+        def finish(ok, incomplete, failed):
             state["busy"] = False
             progress.configure(mode="indeterminate", value=0)
-            set_status(("完成 %d 个，失败 %d 个" % (len(ok), len(failed))) if failed
-                       else "更新完成，重启 DeepSeek Harness 后生效")
-            log("—— 成功 %d，失败 %d ——" % (len(ok), len(failed)))
+            summary = "完成 %d 个，未完成 %d 个，失败 %d 个" % (
+                len(ok), len(incomplete), len(failed))
+            set_status(summary if incomplete or failed else "更新完成，重启 DeepSeek Harness 后生效")
+            log("—— %s ——" % summary)
+            try:
+                current = {n: (d, v) for n, d, v in installed_plugins()}
+                for row in state["rows"]:
+                    name = row["name"]
+                    if name in current:
+                        row["declared"], row["installed"] = current[name]
+                    if name in incomplete:
+                        row["state"] = "incomplete"
+                    elif name in failed:
+                        row["state"] = "failed"
+                    elif name in ok:
+                        row["state"] = "same"
+                paint(state["rows"])
+            except Exception as e:
+                log("刷新本地版本失败，请重新检查：%s" % e)
             btn_check.state(["!disabled"])
             sync_remove()
             if after:
                 after()
-            elif not failed:
-                do_check()
 
         def work():
-            ok, failed = [], []
+            ok, incomplete, failed = [], [], []
             try:
-                ok, failed = run_update(
+                ok, incomplete, failed = run_update(
                     todo, log, on_progress=lambda i: root.after(
-                        0, lambda: progress.configure(value=i)))
+                        0, lambda i=i: progress.configure(value=i)))
             except Exception as e:
                 log("更新失败：%s" % e)
                 failed = [n for n, _ in todo]
-            root.after(0, lambda: finish(ok, failed))
+            root.after(0, lambda: finish(ok, incomplete, failed))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -502,9 +528,9 @@ def main():
         if not todo:
             print("没有需要更新的插件")
             return 0
-        ok, failed = run_update(todo, print)
-        print("成功 %d，失败 %d" % (len(ok), len(failed)))
-        return 1 if failed else 0
+        ok, incomplete, failed = run_update(todo, print)
+        print("成功 %d，未完成 %d，失败 %d" % (len(ok), len(incomplete), len(failed)))
+        return 1 if incomplete or failed else 0
     build_ui().mainloop()
     return 0
 
