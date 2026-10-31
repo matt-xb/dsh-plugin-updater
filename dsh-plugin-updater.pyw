@@ -40,7 +40,7 @@ def dsh_home():
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "DeepSeekHarnessData", ".dsh"),
             r"D:\DeepSeekHarnessData\.dsh"]  # 旧版安装器的默认数据目录
     for p in cand:
-        if p and os.path.isdir(p):
+        if p and os.path.isfile(os.path.join(p, "profiles", PROFILE, "package.json")):
             return p
     return cand[0]
 
@@ -84,12 +84,14 @@ def installed_plugins():
     for name, declared in deps.items():
         if name.startswith(SKIP):
             continue
-        real = declared
+        real = "未知"
         try:
             with open(os.path.join(profile_dir(), "node_modules", name, "package.json"),
                       encoding="utf-8") as f:
-                real = json.load(f)["version"]
-        except Exception:
+                version = json.load(f)["version"]
+                if isinstance(version, str) and _parse(version):
+                    real = version
+        except (OSError, ValueError, KeyError, TypeError):
             pass
         out.append((name, declared, real))
     return out
@@ -132,17 +134,22 @@ def fetch_latest(name):
 
 
 def check_all():
-    rows = [{"name": n, "installed": real, "declared": d, "latest": "-", "state": "same"}
+    rows = [{"name": n, "installed": real, "declared": d, "latest": "-", "state": "unknown"}
             for n, d, real in installed_plugins()]
+    pending = pending_updates()
 
     def one(r):
         if is_local_spec(r["declared"]):
             r["state"] = "skip"
             return
+        if r["name"] in pending:
+            r["latest"] = pending[r["name"]]
+            r["state"] = "incomplete"
+            return
         try:
             r["latest"] = fetch_latest(r["name"])
             r["state"] = {0: "same", -1: "newer", 1: "preview"}.get(
-                cmp_ver(r["installed"], r["latest"]), "same")
+                cmp_ver(r["installed"], r["latest"]), "unknown")
         except Exception as e:  # 单个包查询失败不影响其它
             r["state"] = "error"
             r["error"] = str(e)
@@ -152,13 +159,57 @@ def check_all():
     return rows
 
 
-def run_update(todo, log, on_progress=None):
+def pending_updates():
+    """保留未确认完成的安装，损坏记录不能当作成功。"""
+    try:
+        with open(os.path.join(profile_dir(), ".plugin-updater-pending.json"), encoding="utf-8") as f:
+            pending = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(pending, dict) or any(
+            not isinstance(n, str) or not isinstance(v, str) or _parse(v) is None
+            for n, v in pending.items()):
+        raise ValueError("更新未完成记录无效，请核对 .plugin-updater-pending.json")
+    return pending
+
+
+def save_pending(pending):
+    path = os.path.join(profile_dir(), ".plugin-updater-pending.json")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=profile_dir(),
+                                         prefix=".updater-state-", delete=False) as f:
+            temporary = f.name
+            json.dump(pending, f, ensure_ascii=False)
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def run_update(todo, log, on_progress=None, expected=None):
     """todo: [(包名, 版本)]，串行安装（并发动同一个 node_modules 会打架）。返回 (成功, 未完成, 失败)；非零退出但版本已落盘不等于安装成功。"""
     dsh = find_dsh()
     if not dsh:
         raise RuntimeError("找不到 dsh 命令：DeepSeek Harness 装到别的路径了？")
+    if expected is None:
+        expected = {n: d for n, d, _ in installed_plugins()}
+    pending = pending_updates()
     ok, incomplete, failed = [], [], []
     for i, (name, ver) in enumerate(todo, 1):
+        try:
+            validate_uninstall(name, expected.get(name))
+            current = {n: d for n, d, _ in installed_plugins()}
+            if is_local_spec(current[name]) or _parse(ver) is None:
+                raise ValueError("插件不是 npm 来源或目标版本无效")
+        except ValueError as e:
+            failed.append(name)
+            log("    ✗ %s 更新已取消：%s" % (name, str(e).replace("卸载", "更新")))
+            if on_progress:
+                on_progress(i)
+            continue
+        pending[name] = ver
+        save_pending(pending)
         log("(%d/%d) 安装 %s@%s …" % (i, len(todo), name, ver))
         cmd = (["cmd", "/c", dsh] if os.name == "nt" else [dsh]) + \
               ["plugin", "--profile", PROFILE, "add"]
@@ -166,10 +217,17 @@ def run_update(todo, log, on_progress=None):
         if os.path.exists(os.path.join(profile_dir(), "pnpm-workspace.yaml")):
             cmd.append("-w")
         cmd.append("%s@%s" % (name, ver))
-        p = subprocess.run(cmd, cwd=profile_dir(), capture_output=True, text=True,
-                           env={**os.environ, "DSH_HOME": os.path.abspath(dsh_home())},
-                           encoding="utf-8", errors="replace",
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            p = subprocess.run(cmd, cwd=profile_dir(), capture_output=True, text=True,
+                               env={**os.environ, "DSH_HOME": os.path.abspath(dsh_home())},
+                               encoding="utf-8", errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as e:
+            failed.append(name)
+            log("    ✗ %s 无法启动安装，保留未完成记录：%s" % (name, e))
+            if on_progress:
+                on_progress(i)
+            continue
         out = ((p.stdout or "") + (p.stderr or "")).strip()
         try:
             with open(os.path.join(profile_dir(), "node_modules", name, "package.json"),
@@ -178,6 +236,8 @@ def run_update(todo, log, on_progress=None):
         except (OSError, ValueError, KeyError):
             installed = None
         if p.returncode == 0 and installed == ver:
+            pending.pop(name, None)
+            save_pending(pending)
             ok.append(name)
             log("    ✓ %s 完成" % name)
         elif installed == ver:
@@ -262,16 +322,17 @@ def remove_unused_patch_entries(name, output, log):
     if original.startswith(b"\xef\xbb\xbf"):
         updated = b"\xef\xbb\xbf" + updated
     # shortcut: 仅支持普通块映射；出现复杂 YAML 时需使用正式 YAML 编辑器处理。
-    with tempfile.NamedTemporaryFile(dir=profile_dir(), prefix=".updater-patch-", delete=False) as f:
-        f.write(updated)
-        temporary = f.name
+    temporary = None
     try:
+        with tempfile.NamedTemporaryFile(dir=profile_dir(), prefix=".updater-patch-", delete=False) as f:
+            temporary = f.name
+            f.write(updated)
         with open(path, "rb") as f:
             if f.read() != original:
                 raise RuntimeError("补丁配置已被其他程序修改，停止卸载重试（未替换配置）")
         os.replace(temporary, path)
     finally:
-        if os.path.exists(temporary):
+        if temporary and os.path.exists(temporary):
             os.unlink(temporary)
     log("已移除所选插件的闲置补丁登记（保留补丁文件）：%s" % ", ".join(sorted(selected)))
     return True
@@ -334,8 +395,8 @@ def uninstall_confirm_text(row):
 
 
 STATE_TEXT = {"newer": "有更新", "same": "已是最新", "preview": "本地更新（预览版）",
-              "error": "查询失败", "skip": "跳过（非 npm）",
-              "incomplete": "版本已更新，安装未完成", "failed": "更新失败"}
+              "error": "查询失败", "unknown": "本地或目标版本未知", "skip": "跳过（非 npm）",
+              "incomplete": "安装未完成，可重试", "failed": "更新失败，请重新检查"}
 
 
 def confirm_text(rows, todo):
@@ -387,6 +448,8 @@ def build_ui():
     btn_all = ttk.Button(bar, text="一键更新")
     btn_all.pack(side="left", padx=(8, 0))
     btn_all.state(["disabled"])
+    btn_selected = ttk.Button(bar, text="更新选中插件", state="disabled")
+    btn_selected.pack(side="left", padx=(8, 0))
     btn_remove = ttk.Button(bar, text="卸载选中插件", state="disabled")
     btn_remove.pack(side="left", padx=(8, 0))
     progress = ttk.Progressbar(bar, mode="indeterminate", length=180)
@@ -425,6 +488,8 @@ def build_ui():
         row = selected_row()
         allowed = not state["busy"] and row and not row["name"].startswith(SKIP)
         btn_remove.state(["!disabled"] if allowed else ["disabled"])
+        can_update = allowed and row["state"] in ("newer", "incomplete")
+        btn_selected.state(["!disabled"] if can_update else ["disabled"])
 
     def close():
         if state["busy"]:
@@ -460,6 +525,7 @@ def build_ui():
         btn_check.state(["disabled"])
         btn_all.state(["disabled"])
         btn_remove.state(["disabled"])
+        btn_selected.state(["disabled"])
         progress.start(12)
         set_status("正在检查…")
         state["rows"] = []
@@ -475,7 +541,7 @@ def build_ui():
             else:
                 state["rows"] = rows
                 paint(rows)
-                newer = [r for r in rows if r["state"] == "newer"]
+                newer = [r for r in rows if r["state"] in ("newer", "incomplete")]
                 btn_all.state(["!disabled"] if newer else ["disabled"])
                 set_status("共 %d 个插件，%d 个可更新 · %s"
                            % (len(rows), len(newer), time.strftime("%H:%M:%S")))
@@ -494,10 +560,14 @@ def build_ui():
 
         threading.Thread(target=work, daemon=True).start()
 
-    def do_update(after=None):
+    def do_update(after=None, selected_only=False):
         if state["busy"]:
             return
-        todo = [(r["name"], r["latest"]) for r in state["rows"] if r["state"] == "newer"]
+        selected = selected_row() if selected_only else None
+        rows = [r for r in state["rows"] if r["state"] in ("newer", "incomplete")
+                and (not selected_only or r is selected)]
+        todo = [(r["name"], r["latest"]) for r in rows]
+        expected = {r["name"]: r["declared"] for r in rows}
         if not todo:
             messagebox.showinfo("DSH 插件自动更新", "没有需要更新的插件。")
             return
@@ -507,6 +577,7 @@ def build_ui():
         btn_check.state(["disabled"])
         btn_all.state(["disabled"])
         btn_remove.state(["disabled"])
+        btn_selected.state(["disabled"])
         progress.stop()
         progress.configure(mode="determinate", value=0, maximum=len(todo))
         set_status("正在更新…")
@@ -534,6 +605,8 @@ def build_ui():
             except Exception as e:
                 log("刷新本地版本失败，请重新检查：%s" % e)
             btn_check.state(["!disabled"])
+            btn_all.state(["!disabled"] if any(
+                r["state"] in ("newer", "incomplete") for r in state["rows"]) else ["disabled"])
             sync_remove()
             if after:
                 after()
@@ -542,7 +615,7 @@ def build_ui():
             ok, incomplete, failed = [], [], []
             try:
                 ok, incomplete, failed = run_update(
-                    todo, log, on_progress=lambda i: root.after(
+                    todo, log, expected=expected, on_progress=lambda i: root.after(
                         0, lambda i=i: progress.configure(value=i)))
             except Exception as e:
                 log("更新失败：%s" % e)
@@ -562,6 +635,7 @@ def build_ui():
         btn_check.state(["disabled"])
         btn_all.state(["disabled"])
         btn_remove.state(["disabled"])
+        btn_selected.state(["disabled"])
         progress.start(12)
         set_status("正在卸载 %s…" % row["name"])
 
@@ -590,6 +664,7 @@ def build_ui():
     btn_remove.configure(command=do_remove)
     btn_check.configure(command=do_check)
     btn_all.configure(command=do_update)
+    btn_selected.configure(command=lambda: do_update(selected_only=True))
     log("DSH 插件自动更新 · profile %s" % profile_dir())
     root.after(250, do_check)
     return root
@@ -599,21 +674,38 @@ def main():
     argv = sys.argv[1:]
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if "--check" in argv:
-        rows = check_all()
-        for r in rows:
-            print("%-42s %-12s -> %-12s %s"
-                  % (r["name"], r["installed"], r["latest"], r["state"]))
-        return 0
-    if "--update" in argv:
-        rows = check_all()
-        todo = [(r["name"], r["latest"]) for r in rows if r["state"] == "newer"]
+    if "--check" in argv or "--update" in argv:
+        try:
+            rows = check_all()
+        except Exception as e:
+            print("检查失败：%s" % e)
+            return 1
+        problems = [r for r in rows if r["state"] in ("error", "unknown", "incomplete")]
+        if "--check" in argv:
+            for r in rows:
+                print("%-42s %-12s -> %-12s %s%s"
+                      % (r["name"], r["installed"], r["latest"], r["state"],
+                         "：" + r["error"] if r.get("error") else ""))
+            return 1 if problems else 0
+        for r in problems:
+            print("%s：%s%s" % (r["name"], r["state"],
+                                  "：" + r["error"] if r.get("error") else ""))
+        targets = [r for r in rows if r["state"] in ("newer", "incomplete")
+                   and _parse(r["latest"])]
+        todo = [(r["name"], r["latest"]) for r in targets]
         if not todo:
-            print("没有需要更新的插件")
-            return 0
-        ok, incomplete, failed = run_update(todo, print)
-        print("成功 %d，未完成 %d，失败 %d" % (len(ok), len(incomplete), len(failed)))
-        return 1 if incomplete or failed else 0
+            print("检查存在异常，未执行更新" if problems else "没有需要更新的插件")
+            return 1 if problems else 0
+        expected = {r["name"]: r["declared"] for r in targets}
+        try:
+            ok, incomplete, failed = run_update(todo, print, expected=expected)
+        except Exception as e:
+            print("更新失败：%s" % e)
+            return 1
+        unresolved = [r for r in problems if r["name"] not in ok]
+        print("成功 %d，未完成 %d，失败 %d；检查异常或未修复 %d" %
+              (len(ok), len(incomplete), len(failed), len(unresolved)))
+        return 1 if incomplete or failed or unresolved else 0
     build_ui().mainloop()
     return 0
 

@@ -363,7 +363,7 @@ class TestUninstall(unittest.TestCase):
             self.assertEqual(result, ([], [], ["demo-plugin"]))
 
     def test_cli_incomplete_update_has_nonzero_exit(self):
-        rows = [{"name": "demo-plugin", "latest": "1.1.0", "state": "newer"}]
+        rows = [{"name": "demo-plugin", "declared": "^1.0.0", "latest": "1.1.0", "state": "newer"}]
         with patch.object(updater.sys, "argv", ["updater", "--update"]), \
                 patch.object(updater, "check_all", return_value=rows), \
                 patch.object(updater, "run_update", return_value=([], ["demo-plugin"], [])), \
