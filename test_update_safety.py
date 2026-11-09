@@ -100,6 +100,18 @@ class TestUpdateSafety(unittest.TestCase):
         self.assertEqual(updater.pending_updates(), {"demo-plugin": "1.1.0"})
         self.assertEqual(updater.check_all()[0]["state"], "incomplete")
 
+    def test_incompatible_host_rejection_clears_pending(self):
+        rejected = ("dsh: installation rejected: Plugin demo-plugin@1.1.0 is incompatible with dsh 0.2.1-rc.5: "
+                    'requirements {"engines.dsh":">=0.2.2-rc.1 <0.2.3-0"}. Running it may cause crashes or data loss. '
+                    "dsh: nothing was installed.")
+        with patch.object(updater.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=1, stdout="", stderr=rejected)):
+            self.assertEqual(self.run_update(), ([], [], ["demo-plugin"]))
+        self.assertEqual(updater.pending_updates(), {})
+        # 预检拒绝没有改动任何文件，不能留下会永久卡住的未完成记录
+        with patch.object(updater, "fetch_latest", return_value="1.1.0"):
+            self.assertEqual(updater.check_all()[0]["state"], "newer")
+
     def test_invalid_target_version_rejected_before_command_or_state_write(self):
         for version in ("latest", "^1.0.0", "1.0.0 & echo unsafe", ""):
             with self.subTest(version=version), patch.object(updater.subprocess, "run") as run:

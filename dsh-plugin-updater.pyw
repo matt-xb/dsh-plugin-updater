@@ -187,6 +187,20 @@ def save_pending(pending):
             os.unlink(temporary)
 
 
+def reject_reason(out):
+    """把 dsh 兼容性预检的英文原文压成半句人话，指出插件要求的宿主版本。"""
+    m = re.search(r"is incompatible with dsh ([^\s:]+): (?:requirements|peerDependencies) (\{[^}]*\})", out)
+    if not m:
+        return "当前 DeepSeek Harness 版本不接受这个插件"
+    host, spec = m.group(1), m.group(2)
+    try:
+        need = sorted({v for v in json.loads(spec).values() if isinstance(v, str)})
+    except ValueError:
+        need = []
+    return ("插件要求 %s，当前 DeepSeek Harness %s。请先升级 App 再重试"
+            % ("、".join(need), host)) if need else ("当前 DeepSeek Harness %s 不接受这个插件" % host)
+
+
 def run_update(todo, log, on_progress=None, expected=None):
     """todo: [(包名, 版本)]，串行安装（并发动同一个 node_modules 会打架）。返回 (成功, 未完成, 失败)；非零退出但版本已落盘不等于安装成功。"""
     dsh = find_dsh()
@@ -240,6 +254,14 @@ def run_update(todo, log, on_progress=None, expected=None):
             save_pending(pending)
             ok.append(name)
             log("    ✓ %s 完成" % name)
+        elif installed != ver and "nothing was installed" in out:
+            # 预检拒绝时一个文件都没写，重试同一条命令结果也不会变：
+            # 留下 pending 会永久显示「安装未完成」，正是这个坑。
+            pending.pop(name, None)
+            save_pending(pending)
+            failed.append(name)
+            log("    ✗ %s@%s 被 DeepSeek Harness 拒绝，什么也没装：%s"
+                % (name, ver, reject_reason(out)))
         elif installed == ver:
             incomplete.append(name)
             log("    ⚠ %s 版本已更新，但安装未完成：%s" % (name, out[-600:] or "(无输出)"))
