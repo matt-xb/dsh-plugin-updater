@@ -565,9 +565,16 @@ def build_ui():
                 paint(rows)
                 newer = [r for r in rows if r["state"] in ("newer", "incomplete")]
                 btn_all.state(["!disabled"] if newer else ["disabled"])
-                set_status("共 %d 个插件，%d 个可更新 · %s"
-                           % (len(rows), len(newer), time.strftime("%H:%M:%S")))
-                log("检查完成：%d 个插件，%d 个可更新" % (len(rows), len(newer)))
+                errors = [r for r in rows if r["state"] == "error"]
+                summary = "共 %d 个插件，%d 个可更新" % (len(rows), len(newer))
+                if errors:
+                    summary += "，%d 个查询失败" % len(errors)
+                set_status("%s · %s" % (summary, time.strftime("%H:%M:%S")))
+                log("检查结束：%s" % summary)
+                if errors:
+                    log("查询源：%s；失败项无法判断是否有更新，请检查网络/代理后重新检查。" % REGISTRY)
+                    for row in errors:
+                        log("%s 查询失败：%s" % (row["name"], row.get("error", "未知错误")))
             sync_remove()
             if after:
                 after()

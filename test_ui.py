@@ -14,6 +14,51 @@ spec.loader.exec_module(updater)
 
 
 class TestUI(unittest.TestCase):
+    def test_query_failures_are_visible(self):
+        import tkinter as tk
+        from tkinter import ttk
+        for state in ("error", "newer"):
+            with self.subTest(second_state=state):
+                rows = [{"name": "demo-one", "installed": "1.0.0", "latest": "-",
+                         "state": "error", "error": "connection timed out"},
+                        {"name": "demo-two", "installed": "1.0.0", "latest": "1.1.0",
+                         "state": state, "error": "TLS failure"}]
+                with patch.object(updater, "check_all", return_value=rows), \
+                        patch.object(updater, "profile_dir", return_value="mock-profile"):
+                    try:
+                        root = updater.build_ui()
+                    except tk.TclError as e:
+                        self.skipTest("tkinter display unavailable: %s" % e)
+                    try:
+                        def widgets(w):
+                            for child in w.winfo_children():
+                                yield child
+                                yield from widgets(child)
+                        all_widgets = list(widgets(root))
+                        log = next(w for w in all_widgets if isinstance(w, tk.Text))
+                        buttons = {w.cget("text"): w for w in all_widgets if isinstance(w, ttk.Button)}
+                        deadline = time.monotonic() + 5
+                        def poll():
+                            if "connection timed out" in log.get("1.0", "end") or time.monotonic() >= deadline:
+                                root.quit()
+                            else:
+                                root.after(10, poll)
+                        root.after(10, poll)
+                        root.mainloop()
+                        count = 2 if state == "error" else 1
+                        labels = " ".join(str(w.cget("text")) for w in all_widgets if isinstance(w, ttk.Label))
+                        self.assertIn("%d 个查询失败" % count, labels)
+                        text = log.get("1.0", "end")
+                        self.assertIn("demo-one", text)
+                        self.assertIn("connection timed out", text)
+                        self.assertIn(updater.REGISTRY, text)
+                        if state == "error":
+                            self.assertIn("TLS failure", text)
+                        self.assertEqual(buttons["一键更新"].instate(["disabled"]), state == "error")
+                        self.assertFalse(buttons["检查更新"].instate(["disabled"]))
+                    finally:
+                        root.destroy()
+
     def test_selected_update_and_button_recovery(self):
         import tkinter as tk
         from tkinter import ttk
